@@ -264,7 +264,16 @@ The entire catalog merge and filter step runs inside a single `awk` invocation. 
 
 `c` works the same way. The file scan, filtering, sorting and metadata collection are pipelines rather than per-file shell loops, and hashing runs as one `md5sum` process per `xargs` batch instead of one per file. Packing a 1000-file, 20 MB mod takes a few seconds.
 
+`x` is process-bound rather than I/O-bound, since `tail -c +N` and `dd` both seek straight to the offset - a file at the end of a 20 GB archive costs no more to extract than one at the start. Extraction therefore runs one process per file rather than the six or seven a naive loop needs: output paths are resolved with shell builtins instead of `dirname`, every output directory is created in one batched `mkdir`, the byte range is copied by a single `dd` where GNU `dd` is available (falling back to `tail | head` on macOS and BSD), and hashes are verified in `xargs` batches after the fact instead of one `md5sum` per file.
+
 ## Changelog
+
+### [1.1.1] - 2026-08-13
+
+- Changed:
+  - Extraction is substantially faster. A file now costs one process instead of six or seven - output paths are resolved with shell builtins, every output directory is created in a single batched `mkdir`, the byte range is copied by one `dd` where GNU `dd` is available, and hashes are verified in batches afterwards rather than one `md5sum` per file. Measured 3.4x faster with verification and 2.6x with `-n`; a full 1000-file catalog that previously ran past a two-minute timeout now completes in about a minute. Gains are largest where process creation is expensive.
+- Fixed:
+  - With `-s`, the check that skips already-extracted files tested the unstripped path, so it never matched and every file was re-extracted on each run. It now checks the real output path.
 
 ### [1.1.0] - 2026-08-13
 

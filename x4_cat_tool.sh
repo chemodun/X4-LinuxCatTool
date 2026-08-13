@@ -150,6 +150,7 @@ esac
 # ── dependency check ───────────────────────────────────────────────────────────
 _needed=(awk find sort tail head date mkdir dirname)
 [[ "$COMMAND" == "c" ]] && _needed+=(stat paste tr xargs mktemp sed cat wc)
+[[ "$COMMAND" == "x" ]] && _needed+=(xargs mktemp wc)
 
 _missing=()
 for _cmd in "${_needed[@]}"; do
@@ -178,6 +179,18 @@ if [[ "$COMMAND" == "c" ]]; then
     fi
 fi
 
+# GNU dd extracts a byte range in one process; without it we fall back to
+# tail|head, which costs two.
+_DD_BYTES=0
+if [[ "$COMMAND" == "x" ]]; then
+    if command -v dd &>/dev/null &&
+       dd if=/dev/null of=/dev/null bs=1 count=0 skip=0 \
+          iflag=skip_bytes,count_bytes status=none 2>/dev/null; then
+        _DD_BYTES=1
+    fi
+    verbose "Byte-range extraction: $([[ $_DD_BYTES -eq 1 ]] && echo 'dd' || echo 'tail|head')"
+fi
+
 # ── MD5 helper ─────────────────────────────────────────────────────────────────
 _md5() {
     case "$_md5_tool" in
@@ -188,48 +201,60 @@ _md5() {
 }
 
 # ── extraction helper ──────────────────────────────────────────────────────────
-extract_entry() {
-    local filepath="$1"
-    local dat_file="$2"
-    local offset="$3"
-    local size="$4"
-    local hash="$5"
+# Costs one process per file.  Directory creation and hash verification are
+# batched by the caller, and the output path is precomputed, so nothing else
+# here forks.  GNU dd seeks straight to the offset; the tail|head fallback is
+# for systems whose dd lacks skip_bytes/count_bytes (macOS, BSD).
+write_entry() {
+    local dat_file="$1" out_path="$2" offset="$3" size="$4"
 
-    # Optionally strip the filter prefix from the output path
-    local out_rel="$filepath"
-    if [[ $STRIP_PREFIX -eq 1 && -n "$FILTER" && "$out_rel" == "$FILTER"* ]]; then
-        out_rel="${out_rel#$FILTER}"
-        out_rel="${out_rel#/}"
-    fi
-
-    local out_path="$DEST_DIR/$out_rel"
-
-    mkdir -p "$(dirname "$out_path")"
-
-    if [[ $VERBOSE -eq 1 ]]; then
-        log "  Extract: $filepath -> $out_rel  (dat=$(basename "$dat_file")  off=$offset  sz=$size)"
-    elif [[ "$out_rel" != "$filepath" ]]; then
-        log "  Extract: $filepath -> $out_rel"
+    if [[ $_DD_BYTES -eq 1 ]]; then
+        dd if="$dat_file" of="$out_path" bs=1M status=none \
+           iflag=skip_bytes,count_bytes skip="$offset" count="$size"
     else
-        log "  Extract: $filepath"
+        # tail -c +N is 1-based: byte at offset O is at position O+1.
+        # Disable pipefail for this pipeline: when head exits after reading $size
+        # bytes, tail gets SIGPIPE (exit 141) which would abort under pipefail.
+        ( set +o pipefail; tail -c "+$(( offset + 1 ))" "$dat_file" | head -c "$size" ) > "$out_path"
+    fi
+}
+
+# Verify every extracted file in one md5 process per xargs batch rather than
+# one (plus an awk) per file.  Order is preserved, so results pair positionally
+# with the expected hashes.
+verify_batch() {
+    local n=${#vf_paths[@]}
+    [[ $n -eq 0 ]] && return 0
+
+    local actual_file="$_TMP_DIR/actual_hashes"
+    case "$_md5_tool" in
+        md5sum) printf '%s\0' "${vf_paths[@]}" | xargs -0 md5sum \
+                    | awk '{ h = $1; sub(/^\\/, "", h); print h }' > "$actual_file" ;;
+        md5)    printf '%s\0' "${vf_paths[@]}" | xargs -0 md5 -q > "$actual_file" ;;
+    esac
+
+    local produced
+    produced=$(( $(wc -l < "$actual_file") + 0 ))
+    if [[ $produced -ne $n ]]; then
+        log "  WARNING hash verification incomplete: expected $n hashes, got $produced"
+        return 0
     fi
 
-    # tail -c +N is 1-based: byte at offset O is at position O+1.
-    # Disable pipefail for this pipeline: when head exits after reading $size bytes,
-    # tail gets SIGPIPE (exit 141) which would abort the script under set -o pipefail.
-    ( set +o pipefail; tail -c "+$(( offset + 1 ))" "$dat_file" | head -c "$size" ) > "$out_path"
-
-    if [[ $SKIP_HASH -eq 0 && -n "$hash" ]]; then
-        local actual
-        actual="$(_md5 "$out_path")"
-        if [[ "${actual,,}" != "${hash,,}" ]]; then
-            log "  WARNING hash mismatch for $filepath"
-            log "    expected : $hash"
+    local i=0 actual expected mismatches=0
+    while IFS= read -r actual; do
+        expected="${vf_hashes[$i]}"
+        if [[ "${actual,,}" != "${expected,,}" ]]; then
+            log "  WARNING hash mismatch for ${vf_names[$i]}"
+            log "    expected : $expected"
             log "    actual   : $actual"
-        else
-            verbose "  Hash OK: $filepath"
+            (( mismatches++ )) || true
         fi
-    fi
+        # "|| true": (( i++ )) returns 1 when i is 0, which set -e would treat as failure.
+        (( i++ )) || true
+    done < "$actual_file"
+
+    verbose "  Hashes verified: $n  mismatches: $mismatches"
+    return 0
 }
 
 # ── create (pack) ──────────────────────────────────────────────────────────────
@@ -527,7 +552,7 @@ matched_entries=$(awk \
     ' "${cat_files[@]}" | sort
 )
 
-# ── ls / extract loop ──────────────────────────────────────────────────────────
+# ── ls ─────────────────────────────────────────────────────────────────────────
 if [[ "$COMMAND" == "ls" ]]; then
     if [[ ${#cat_files[@]} -gt 1 ]]; then
         printf "%-12s  %-19s  %-12s  %s\n" "SIZE" "DATE" "CAT" "PATH"
@@ -536,17 +561,11 @@ if [[ "$COMMAND" == "ls" ]]; then
         printf "%-12s  %-19s  %s\n" "SIZE" "DATE" "PATH"
         printf "%-12s  %-19s  %s\n" "------------" "-------------------" "----"
     fi
-fi
 
-extracted=0
-deleted=0
-skipped=0
-listed=0
+    listed=0
+    while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
+        [[ -z "$filepath" ]] && continue
 
-while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
-    [[ -z "$filepath" ]] && continue
-
-    if [[ "$COMMAND" == "ls" ]]; then
         date_str=""
         if [[ -n "$ts" && "$ts" != "0" ]]; then
             date_str=$(date -d "@${ts}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
@@ -570,8 +589,29 @@ while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
             fi
         fi
         (( listed++ )) || true
-        continue
-    fi
+    done <<< "$matched_entries"
+
+    log "────────────────────────────────────────"
+    log "Listed               : $listed"
+    exit 0
+fi
+
+# ── extract ────────────────────────────────────────────────────────────────────
+# Three phases, so a file costs one process instead of roughly seven:
+#   1. plan   — a fork-free scan that resolves output paths and collects the
+#               directory set (path handling is bash builtins, not dirname)
+#   2. mkdir  — every directory created in one batched call
+#   3. write  — one dd per file, then hashes verified in batches
+extracted=0
+deleted=0
+skipped=0
+
+ex_names=(); ex_dats=(); ex_paths=(); ex_offsets=(); ex_sizes=()
+vf_names=(); vf_paths=(); vf_hashes=()
+declare -A ex_dirs=()
+
+while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
+    [[ -z "$filepath" ]] && continue
 
     if [[ "$size" -eq 0 ]]; then
         verbose "  Deleted/empty (size=0): $filepath"
@@ -579,21 +619,58 @@ while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
         continue
     fi
 
-    if [[ -f "$DEST_DIR/$filepath" && $FORCE -eq 0 ]]; then
+    # Optionally strip the filter prefix from the output path
+    out_rel="$filepath"
+    if [[ $STRIP_PREFIX -eq 1 && -n "$FILTER" && "$out_rel" == "$FILTER"* ]]; then
+        out_rel="${out_rel#$FILTER}"
+        out_rel="${out_rel#/}"
+    fi
+    out_path="$DEST_DIR/$out_rel"
+
+    if [[ -f "$out_path" && $FORCE -eq 0 ]]; then
         verbose "  Skip (exists): $filepath"
         (( skipped++ )) || true
         continue
     fi
 
-    extract_entry "$filepath" "$dat_file" "$offset" "$size" "$hash"
-    (( extracted++ )) || true
+    ex_names+=("$filepath")
+    ex_dats+=("$dat_file")
+    ex_paths+=("$out_path")
+    ex_offsets+=("$offset")
+    ex_sizes+=("$size")
+    ex_dirs["${out_path%/*}"]=1
+
+    if [[ $SKIP_HASH -eq 0 && -n "$hash" ]]; then
+        vf_names+=("$filepath")
+        vf_paths+=("$out_path")
+        vf_hashes+=("$hash")
+    fi
 done <<< "$matched_entries"
 
-log "────────────────────────────────────────"
-if [[ "$COMMAND" == "ls" ]]; then
-    log "Listed               : $listed"
-else
-    log "Extracted            : $extracted"
-    log "Deleted/empty (sz=0) : $deleted"
-    log "Skipped (exists)     : $skipped"
+extracted=${#ex_paths[@]}
+
+if [[ $extracted -gt 0 ]]; then
+    _TMP_DIR="$(mktemp -d)"
+    trap '[[ -n "${_TMP_DIR:-}" ]] && rm -rf "$_TMP_DIR"' EXIT
+
+    printf '%s\0' "${!ex_dirs[@]}" | xargs -0 mkdir -p
+
+    for (( i = 0; i < extracted; i++ )); do
+        if [[ $VERBOSE -eq 1 ]]; then
+            log "  Extract: ${ex_names[i]} -> ${ex_paths[i]#$DEST_DIR/}  (dat=${ex_dats[i]##*/}  off=${ex_offsets[i]}  sz=${ex_sizes[i]})"
+        elif [[ "${ex_paths[i]}" != "$DEST_DIR/${ex_names[i]}" ]]; then
+            log "  Extract: ${ex_names[i]} -> ${ex_paths[i]#$DEST_DIR/}"
+        else
+            log "  Extract: ${ex_names[i]}"
+        fi
+
+        write_entry "${ex_dats[i]}" "${ex_paths[i]}" "${ex_offsets[i]}" "${ex_sizes[i]}"
+    done
+
+    verify_batch
 fi
+
+log "────────────────────────────────────────"
+log "Extracted            : $extracted"
+log "Deleted/empty (sz=0) : $deleted"
+log "Skipped (exists)     : $skipped"
