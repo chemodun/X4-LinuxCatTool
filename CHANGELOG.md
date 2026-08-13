@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/chemodun/X4-LinuxCatTool/compare/v1.1.1...v1.2.0) (2026-08-13)
+
+
+### Features
+
+* parallel extraction ([ed757a2](https://github.com/chemodun/X4-LinuxCatTool/commit/ed757a251a80be48eda24dc18bb2cedb51441e17))
+
 ## [1.1.1](https://github.com/chemodun/X4-LinuxCatTool/compare/v1.1.0...v1.1.1) (2026-08-13)
 
 
