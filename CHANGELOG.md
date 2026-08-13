@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/chemodun/X4-LinuxCatTool/compare/v1.1.0...v1.1.1) (2026-08-13)
+
+
+### Performance Improvements
+
+* extract one process per file instead of seven ([386e839](https://github.com/chemodun/X4-LinuxCatTool/commit/386e83922978643585b8856605c3a218d833409d))
+
 ## [1.1.0](https://github.com/chemodun/X4-LinuxCatTool/compare/v1.0.0...v1.1.0) (2026-08-13)
 
 
