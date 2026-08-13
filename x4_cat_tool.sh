@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# x4_cat_tool.sh — Extract / list files from X4 Foundations cat/dat archives
+# x4_cat_tool.sh — Create / extract / list files in X4 Foundations cat/dat archives
 #
 # Cat format per line:
 #   <filepath> <size_bytes> <unix_timestamp> <md5_32hex>
@@ -11,36 +11,72 @@
 #
 # Single-cat-file mode:
 #   Only that .cat/.dat pair is processed.  Size-0 entries produce no output.
+#
+# Create mode — format rules verified against XRCatTool.exe 1.10:
+#   * LF line endings, no header, no BOM; a trailing newline is present.
+#   * Paths use forward slashes and keep their original case.
+#   * Entries are sorted by the LOWERCASED path in C byte order.
+#   * The timestamp is the source file's mtime, not the time of packing.
+#   * A zero-byte file is stored with 32 zeros as its hash — the md5 of an empty
+#     file is never written.
+#   * The .dat is a plain concatenation in catalog order: no header, no padding.
+#   * Include/exclude patterns are regexes matched as a SUBSTRING SEARCH against
+#     the lowercased path.  Several -I are OR-ed; -E is applied after -I.
 
 set -euo pipefail
+
+VERSION="1.0.0"  # x-release-please-version
 
 # ── usage ─────────────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
+$(basename "$0") $VERSION
+
 Usage: $(basename "$0") [OPTIONS] <source> <command> <path_or_mask> [<dest_dir>]
+       $(basename "$0") [OPTIONS] <source_dir> c <out.cat>
 
   source        Folder containing cat/dat files  OR  a single .cat file
+                For 'c': the folder to pack
   command       x   — extract matched files to dest_dir
                 ls  — list matched files (no extraction; dest_dir not needed)
+                c   — create a cat/dat pair from a folder
   path_or_mask  Path prefix ("assets/textures") or glob mask ("assets/*.xml")
                 A plain prefix matches ALL files whose path starts with it,
                 even without a trailing wildcard.
-  dest_dir      Output directory (required for 'x', ignored for 'ls')
+                "*" matches the whole catalog; an empty mask matches NOTHING.
+                For 'c': the output catalog name, which must end in '.cat'
+  dest_dir      Output directory (required for 'x', ignored for 'ls' and 'c')
 
-Options:
-  -f   Force overwrite of existing files  (x only)
+Options (x / ls):
   -n   Skip MD5 hash verification          (x only)
   -s   Strip the filter path prefix from output paths  (x only)
        e.g. filter "assets/textures" → file stored as "ui/foo.gz" not "assets/textures/ui/foo.gz"
+
+Options (c):
+  -i <dir>  Additional input folder; repeatable.  Files from later folders
+            override files of the same name from earlier ones.
+  -I <re>   Include only paths matching this regex; repeatable (OR-ed).
+  -E <re>   Exclude paths matching this regex; repeatable, applied after -I.
+            Both are extended regexes matched as a substring search against the
+            LOWERCASED path — "^assets/" anchors, "content.xml" matches anywhere.
+  -a   Append to an existing catalog instead of replacing it.
+
+Options (all):
+  -f   Force overwrite of existing files / of an existing catalog
   -v   Verbose output
+  -V   Show version and exit
   -h   Show this help
 
 Examples:
-  $(basename "$0") /game/x4        x   assets/textures   /tmp/out
-  $(basename "$0") /game/x4/01.cat x   "libraries/*.xml" /tmp/out
-  $(basename "$0") -fv /game/x4    x   maps              /tmp/out
-  $(basename "$0") /game/x4        ls  assets/textures
-  $(basename "$0") /game/x4        ls  "libraries/*.xml"
+  ./$(basename "$0") /game/x4        x   assets/textures   /tmp/out
+  ./$(basename "$0") /game/x4/01.cat x   "libraries/*.xml" /tmp/out
+  ./$(basename "$0") /game/x4/01.cat x   "*"               /tmp/out
+  ./$(basename "$0") -fv /game/x4    x   maps              /tmp/out
+  ./$(basename "$0") /game/x4        ls  assets/textures
+  ./$(basename "$0") /game/x4        ls  "libraries/*.xml"
+  ./$(basename "$0") ./my_mod        c   ext_01.cat
+  ./$(basename "$0") -v -E "^assets/" ./my_mod c ext_01.cat
+  ./$(basename "$0") -I "ui/addons/ego_debuglog/ui.xml" ./my_mod c subst_01.cat
 
 Priority rules (folder mode):
   Cat files sorted by name; entry from the highest-numbered cat wins.
@@ -57,13 +93,22 @@ FORCE=0
 SKIP_HASH=0
 STRIP_PREFIX=0
 VERBOSE=0
+APPEND=0
+EXTRA_INPUTS=()
+INCLUDES=()
+EXCLUDES=()
 
-while getopts "fnsvh" opt; do
+while getopts "afnsvVhi:I:E:" opt; do
     case $opt in
+        a) APPEND=1 ;;
         f) FORCE=1 ;;
         n) SKIP_HASH=1 ;;
         s) STRIP_PREFIX=1 ;;
         v) VERBOSE=1 ;;
+        V) printf '%s %s\n' "$(basename "$0")" "$VERSION"; exit 0 ;;
+        i) EXTRA_INPUTS+=("$OPTARG") ;;
+        I) INCLUDES+=("$OPTARG") ;;
+        E) EXCLUDES+=("$OPTARG") ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -77,6 +122,15 @@ COMMAND="$2"
 FILTER="$3"
 DEST_DIR="${4:-}"
 
+# Combine repeated -I/-E into one alternation each; empty means "no filter".
+build_alt_re() {
+    local out="" p
+    for p in "$@"; do out="${out:+$out|}($p)"; done
+    printf '%s' "$out"
+}
+INC_RE=""; [[ ${#INCLUDES[@]} -gt 0 ]] && INC_RE="$(build_alt_re "${INCLUDES[@]}")"
+EXC_RE=""; [[ ${#EXCLUDES[@]} -gt 0 ]] && EXC_RE="$(build_alt_re "${EXCLUDES[@]}")"
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 log()     { printf '%s\n' "$*" >&2; }
 verbose() { [[ $VERBOSE -eq 1 ]] && printf '%s\n' "$*" >&2 || true; }
@@ -87,14 +141,18 @@ case "$COMMAND" in
         [[ -z "$DEST_DIR" ]] && { log "Error: dest_dir is required for the 'x' command."; usage; }
         ;;
     ls) ;;
+    c)  ;;
     *)
-        die "Unknown command '$COMMAND'. Use 'x' or 'ls'."
+        die "Unknown command '$COMMAND'. Use 'x', 'ls' or 'c'."
         ;;
 esac
 
 # ── dependency check ───────────────────────────────────────────────────────────
+_needed=(awk find sort tail head date mkdir dirname)
+[[ "$COMMAND" == "c" ]] && _needed+=(stat paste tr xargs mktemp sed cat wc)
+
 _missing=()
-for _cmd in awk find sort tail head date mkdir dirname; do
+for _cmd in "${_needed[@]}"; do
     command -v "$_cmd" &>/dev/null || _missing+=("$_cmd")
 done
 
@@ -109,7 +167,16 @@ if [[ ${#_missing[@]} -gt 0 ]]; then
     for _t in "${_missing[@]}"; do log "  - $_t"; done
     exit 1
 fi
-verbose "Tools OK: awk find sort tail head date mkdir dirname $_md5_tool"
+verbose "Tools OK: ${_needed[*]} $_md5_tool"
+
+# GNU and BSD stat disagree on how to ask for "size and mtime".
+_stat_cmd=()
+if [[ "$COMMAND" == "c" ]]; then
+    if   stat -c '%s %Y' . &>/dev/null; then _stat_cmd=(stat -c '%s %Y')
+    elif stat -f '%z %m' . &>/dev/null; then _stat_cmd=(stat -f '%z %m')
+    else die "Neither GNU (stat -c) nor BSD (stat -f) stat syntax works here."
+    fi
+fi
 
 # ── MD5 helper ─────────────────────────────────────────────────────────────────
 _md5() {
@@ -164,6 +231,159 @@ extract_entry() {
         fi
     fi
 }
+
+# ── create (pack) ──────────────────────────────────────────────────────────────
+# Builds <out>.cat / <out>.dat from one or more input folders.  Everything runs
+# through find/awk/sort/xargs pipelines rather than a per-file bash loop, since
+# a full game folder is 450 000+ entries.
+create_catalog() {
+    local out_cat="$1"
+
+    if [[ "$out_cat" != *.cat ]]; then
+        die "Output '$out_cat' must end with '.cat'."
+    fi
+    if [[ "$out_cat" == *_sig.cat ]]; then
+        die "Refusing to write a signature catalog (*_sig.cat)."
+    fi
+    local out_dat="${out_cat%.cat}.dat"
+
+    local appending=0
+    if [[ $APPEND -eq 1 && -f "$out_cat" && -f "$out_dat" ]]; then
+        appending=1
+    elif [[ $FORCE -eq 0 ]] && [[ -e "$out_cat" || -e "$out_dat" ]]; then
+        die "'$out_cat' or its .dat already exists. Use -f to overwrite, or -a to append."
+    fi
+
+    mkdir -p "$(dirname "$out_cat")"
+
+    # Global, not local: the EXIT trap fires after this function has returned.
+    _TMP_DIR="$(mktemp -d)"
+    trap '[[ -n "${_TMP_DIR:-}" ]] && rm -rf "$_TMP_DIR"' EXIT
+    local tmp="$_TMP_DIR"
+
+    # Input roots, one per line: line N holds root index N-1.
+    local root
+    : > "$tmp/roots"
+    for root in "${INPUTS[@]}"; do
+        root="${root%/}"
+        [[ -d "$root" ]] || die "Input '$root' is not a folder."
+        printf '%s\n' "$root" >> "$tmp/roots"
+    done
+
+    # Raw list "relpath <TAB> root_index", in input order so later roots win.
+    # -L follows symlinks/junctions, which dev mod trees rely on.
+    : > "$tmp/raw"
+    local idx=0
+    while IFS= read -r root; do
+        verbose "Reading from folder $root"
+        ( cd "$root" && find -L . -type f -print ) \
+            | sed 's|^\./||' \
+            | awk -v i="$idx" '{ print $0 "\t" i }' >> "$tmp/raw"
+        idx=$(( idx + 1 ))
+    done < "$tmp/roots"
+
+    # Filter, fold case for the sort key, and let a later root override an
+    # earlier one.  The regexes travel via the environment: passing them with
+    # -v would make awk eat the backslash in "\." before it ever becomes a regex.
+    INC_RE="$INC_RE" EXC_RE="$EXC_RE" awk -F'\t' '
+        BEGIN { inc = ENVIRON["INC_RE"]; exc = ENVIRON["EXC_RE"] }
+        {
+            rel = $1
+            lc  = tolower(rel)
+            if (inc != "" && lc !~ inc) next
+            if (exc != "" && lc ~  exc) next
+            keep[lc] = rel "\t" $2
+        }
+        END { for (k in keep) print k "\t" keep[k] }
+    ' "$tmp/raw" | LC_ALL=C sort -t$'\t' -k1,1 > "$tmp/sorted"
+
+    local n
+    n=$(wc -l < "$tmp/sorted")
+    n=$(( n + 0 ))
+
+    if [[ $n -eq 0 ]]; then
+        log "Warning: no files matched — writing an empty catalog."
+        if [[ $appending -eq 0 ]]; then
+            : > "$out_cat"
+            : > "$out_dat"
+        fi
+        log "────────────────────────────────────────"
+        log "Catalog              : $out_cat"
+        log "Entries written      : 0"
+        return 0
+    fi
+
+    # Absolute source path per entry, in catalog order.
+    awk -F'\t' 'NR == FNR { roots[FNR-1] = $0; next } { print roots[$3] "/" $2 }' \
+        "$tmp/roots" "$tmp/sorted" > "$tmp/abs"
+
+    # One stat/md5 process per xargs batch instead of per file.  Both preserve
+    # argument order, so results are pasted back positionally — md5sum's own
+    # path output is unusable, it escapes backslashes in names.
+    tr '\n' '\0' < "$tmp/abs" | xargs -0 "${_stat_cmd[@]}" > "$tmp/meta"
+    case "$_md5_tool" in
+        md5sum) tr '\n' '\0' < "$tmp/abs" | xargs -0 md5sum \
+                    | awk '{ h = $1; sub(/^\\/, "", h); print h }' > "$tmp/hash" ;;
+        md5)    tr '\n' '\0' < "$tmp/abs" | xargs -0 md5 -q      > "$tmp/hash" ;;
+    esac
+
+    # A short read here would silently pair hashes with the wrong files.
+    local n_meta n_hash
+    n_meta=$(( $(wc -l < "$tmp/meta") + 0 ))
+    n_hash=$(( $(wc -l < "$tmp/hash") + 0 ))
+    if [[ $n_meta -ne $n || $n_hash -ne $n ]]; then
+        die "Metadata desync: $n entries, $n_meta stat lines, $n_hash hashes."
+    fi
+
+    paste "$tmp/sorted" "$tmp/abs" "$tmp/meta" "$tmp/hash" \
+      | awk -F'\t' \
+            -v verbose_mode="$VERBOSE" \
+            -v blockfile="$tmp/catblock" \
+            -v listfile="$tmp/datlist" '
+        BEGIN { zero = "00000000000000000000000000000000" }
+        {
+            rel = $2; abs = $4; hash = $6
+            split($5, m, " ")
+            size = m[1]; mtime = m[2]
+
+            # A zero-byte file is stored with a zero hash, never md5("").
+            if (size + 0 == 0) hash = zero
+
+            print rel " " size " " mtime " " hash > blockfile
+            if (size + 0 > 0) print abs > listfile
+            if (verbose_mode) printf "%12s %s %s\n", size, mtime, rel > "/dev/stderr"
+        }
+    '
+
+    if [[ $appending -eq 1 ]]; then
+        log "Appending to catalog $out_cat"
+        cat "$tmp/catblock" >> "$out_cat"
+    else
+        log "Writing catalog $out_cat"
+        cat "$tmp/catblock" > "$out_cat"
+        : > "$out_dat"
+    fi
+
+    # Guarded: "xargs cat" with no input would read stdin and hang.
+    if [[ -s "$tmp/datlist" ]]; then
+        tr '\n' '\0' < "$tmp/datlist" | xargs -0 cat >> "$out_dat"
+    fi
+
+    log "────────────────────────────────────────"
+    log "Catalog              : $out_cat"
+    log "Entries written      : $n"
+    log "Data size            : $(wc -c < "$out_dat" | tr -d ' ') bytes"
+    return 0
+}
+
+if [[ "$COMMAND" == "c" ]]; then
+    INPUTS=("$SOURCE")
+    [[ ${#EXTRA_INPUTS[@]} -gt 0 ]] && INPUTS+=("${EXTRA_INPUTS[@]}")
+    [[ -n "$INC_RE" ]] && log "Include : $INC_RE"
+    [[ -n "$EXC_RE" ]] && log "Exclude : $EXC_RE"
+    create_catalog "$FILTER"
+    exit 0
+fi
 
 # ── collect cat files ──────────────────────────────────────────────────────────
 cat_files=()
