@@ -62,6 +62,7 @@ Files are split across multiple numbered catalog pairs (`01.cat`/`01.dat`, `02.c
 | `-f` | `x` `c` | Force overwrite of already-existing output files or of an existing catalog |
 | `-n` | `x` | Skip MD5 hash verification after extraction |
 | `-s` | `x` | Strip the filter path prefix from output paths (see [Strip prefix](#strip-prefix)) |
+| `-j [N]` | `x` | Extract with N parallel workers. Without N, one per CPU core minus one (see [Parallel extraction](#parallel-extraction)) |
 | `-i <dir>` | `c` | Additional input folder; repeatable. Files from later folders override same-named files from earlier ones |
 | `-I <re>` | `c` | Include only paths matching this regex; repeatable, OR-ed together |
 | `-E <re>` | `c` | Exclude paths matching this regex; repeatable, applied after `-I` |
@@ -124,6 +125,38 @@ The log shows both paths when stripping is active:
 ```
   Extract: assets/textures/ui/player_info/icon_logbook_alerts.gz -> icon_logbook_alerts.gz
 ```
+
+#### Parallel extraction
+
+Extraction is sequential unless `-j` is given. `-j` splits it across several worker processes, and the count is optional:
+
+```bash
+./x4_cat_tool.sh -j  /game/x4 x '*' /tmp/out   # auto: one worker per core, minus one
+./x4_cat_tool.sh -j4 /game/x4 x '*' /tmp/out   # exactly 4 workers
+./x4_cat_tool.sh -j1 /game/x4 x '*' /tmp/out   # sequential, the default
+```
+
+Without a number, the tool uses one worker per CPU core minus one, so the machine stays usable while a large extraction runs. The core count comes from `nproc`, `getconf _NPROCESSORS_ONLN`, `sysctl -n hw.ncpu` or `NUMBER_OF_PROCESSORS`, whichever exists first; if none does it falls back to a single worker.
+
+A number you pass yourself wins, but it is capped at the core count - asking for more workers than there are cores only adds contention. The cap is reported when it applies:
+
+```
+Note    : -j 99 capped at 12 (CPU cores)
+```
+
+The number of workers actually started is printed before extraction begins, and can be lower than requested when there are fewer files than workers:
+
+```
+Workers : 11
+```
+
+Each worker takes one contiguous slice of the file list, sized so every worker gets roughly the same amount of work - bytes plus a flat per-file charge, since extraction is process-bound and a run of tiny files is real work too. Each slice is hash-verified by the worker that wrote it, so verification is parallel as well, and the mismatch total across all workers is reported at the end:
+
+```
+Hash mismatches      : 0
+```
+
+The one visible cost is ordering: with more than one worker the per-file `Extract:` lines from different workers interleave, so they no longer appear in catalog order. The extracted files themselves are identical either way. If a worker dies, the run stops with a non-zero exit status naming how many failed.
 
 ### `c` - Create a catalog
 
@@ -227,6 +260,9 @@ Only the specified `.cat`/`.dat` pair is used. Size-0 entries produce no output.
 # Extract an entire catalog
 ./x4_cat_tool.sh '/c/Program Files (x86)/X4 Foundations/01.cat' x '*' /tmp/all
 
+# Extract an entire catalog with one worker per core (minus one)
+./x4_cat_tool.sh -j '/c/Program Files (x86)/X4 Foundations/01.cat' x '*' /tmp/all
+
 # Pack a mod folder into a catalog pair
 ./x4_cat_tool.sh ./my_mod c ext_01.cat
 
@@ -256,6 +292,8 @@ A deletion marker, which the game reads as "this file is absent", is an entry wi
 
 Available out of the box on any Linux distribution and macOS. Both GNU (`stat -c`) and BSD/macOS (`stat -f`) syntax are detected automatically.
 
+`-j` needs nothing beyond bash itself. Core detection tries `nproc`, `getconf`, `sysctl` and `NUMBER_OF_PROCESSORS` in that order, and falls back to a single worker if none of them answers.
+
 Source paths containing tab or newline characters are not supported, as the pipelines are tab- and line-delimited. Neither is representable in an X4 mod.
 
 ## Performance
@@ -266,10 +304,24 @@ The entire catalog merge and filter step runs inside a single `awk` invocation. 
 
 `x` is process-bound rather than I/O-bound, since `tail -c +N` and `dd` both seek straight to the offset - a file at the end of a 20 GB archive costs no more to extract than one at the start. Extraction therefore runs one process per file rather than the six or seven a naive loop needs: output paths are resolved with shell builtins instead of `dirname`, every output directory is created in one batched `mkdir`, the byte range is copied by a single `dd` where GNU `dd` is available (falling back to `tail | head` on macOS and BSD), and hashes are verified in `xargs` batches after the fact instead of one `md5sum` per file.
 
+Because that remaining process per file is the floor, `-j` is what cuts into it - the workers spend most of their time in `dd` and `md5sum`, which run concurrently. Extracting a 1039-file, 20 MB catalog on a 12-core machine, with hash verification on:
+
+```
+-j 1    61s
+-j 2    33s
+-j 4    23s
+-j 11   17s
+```
+
+Returns flatten out well before the core count is reached, so there is little point forcing a high `-j` by hand - and none at all above the cores available, which is why the tool caps it there. The measurements above are from Git Bash on Windows, where creating a process is unusually expensive; on Linux the sequential baseline is far lower and the parallel gain correspondingly smaller.
+
 ## Changelog
 
-### [1.1.1] - 2026-08-13
+### [1.2.0] - 2026-08-13
 
+- Added:
+  - `-j [N]` - extract with several worker processes at once. The count is optional: a bare `-j` uses one worker per CPU core minus one, so the machine stays usable, while `-j 4` sets it explicitly. A hand-picked count is capped at the number of cores, and `-j 1` keeps the sequential path. Each worker writes and hash-verifies its own contiguous slice of the file list, sized by bytes plus a flat per-file charge so the slices cost about the same. Measured on a 1039-file catalog with verification on: 61s sequential, 23s at `-j 4`, 17s at `-j 11`.
+  - The number of hash mismatches is now reported in the extraction summary instead of only appearing as individual warnings.
 - Changed:
   - Extraction is substantially faster. A file now costs one process instead of six or seven - output paths are resolved with shell builtins, every output directory is created in a single batched `mkdir`, the byte range is copied by one `dd` where GNU `dd` is available, and hashes are verified in batches afterwards rather than one `md5sum` per file. Measured 3.4x faster with verification and 2.6x with `-n`; a full 1000-file catalog that previously ran past a two-minute timeout now completes in about a minute. Gains are largest where process creation is expensive.
 - Fixed:

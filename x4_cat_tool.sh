@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.1"  # x-release-please-version
+VERSION="1.1.0"  # x-release-please-version
 
 # ── usage ─────────────────────────────────────────────────────────────────────
 usage() {
@@ -51,6 +51,12 @@ Options (x / ls):
   -n   Skip MD5 hash verification          (x only)
   -s   Strip the filter path prefix from output paths  (x only)
        e.g. filter "assets/textures" → file stored as "ui/foo.gz" not "assets/textures/ui/foo.gz"
+  -j [N]  Extract with N parallel workers  (x only)
+       Extraction is sequential unless this is given.
+       Without N: one per CPU core, minus one, never below 1.
+       N above the core count is capped at it; -j 1 is the sequential
+       default.  With more than one worker the per-file log lines are no
+       longer in catalog order.
 
 Options (c):
   -i <dir>  Additional input folder; repeatable.  Files from later folders
@@ -71,6 +77,8 @@ Examples:
   ./$(basename "$0") /game/x4        x   assets/textures   /tmp/out
   ./$(basename "$0") /game/x4/01.cat x   "libraries/*.xml" /tmp/out
   ./$(basename "$0") /game/x4/01.cat x   "*"               /tmp/out
+  ./$(basename "$0") -j  /game/x4    x   "*"               /tmp/out
+  ./$(basename "$0") -j4 /game/x4    x   "*"               /tmp/out
   ./$(basename "$0") -fv /game/x4    x   maps              /tmp/out
   ./$(basename "$0") /game/x4        ls  assets/textures
   ./$(basename "$0") /game/x4        ls  "libraries/*.xml"
@@ -94,17 +102,26 @@ SKIP_HASH=0
 STRIP_PREFIX=0
 VERBOSE=0
 APPEND=0
+JOBS=1
 EXTRA_INPUTS=()
 INCLUDES=()
 EXCLUDES=()
 
-while getopts "afnsvVhi:I:E:" opt; do
+while getopts "afnsvVhi:I:E:j:" opt; do
     case $opt in
         a) APPEND=1 ;;
         f) FORCE=1 ;;
         n) SKIP_HASH=1 ;;
         s) STRIP_PREFIX=1 ;;
         v) VERBOSE=1 ;;
+        # -j takes an optional count.  getopts cannot express that, so the
+        # argument is always consumed and handed back when it is not a number.
+        j) if [[ "$OPTARG" =~ ^[0-9]+$ ]]; then
+               JOBS="$OPTARG"
+           else
+               JOBS=0
+               OPTIND=$(( OPTIND - 1 ))
+           fi ;;
         V) printf '%s %s\n' "$(basename "$0")" "$VERSION"; exit 0 ;;
         i) EXTRA_INPUTS+=("$OPTARG") ;;
         I) INCLUDES+=("$OPTARG") ;;
@@ -191,6 +208,37 @@ if [[ "$COMMAND" == "x" ]]; then
     verbose "Byte-range extraction: $([[ $_DD_BYTES -eq 1 ]] && echo 'dd' || echo 'tail|head')"
 fi
 
+# Number of CPU cores: both the default for a bare "-j" and the ceiling on an
+# explicit "-j N".  nproc is Linux, getconf is POSIX, sysctl is macOS/BSD,
+# NUMBER_OF_PROCESSORS is what Git Bash sets on Windows.
+cpu_count() {
+    local n=""
+    if   command -v nproc   &>/dev/null; then n=$(nproc                     2>/dev/null || true)
+    elif command -v getconf &>/dev/null; then n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+    elif command -v sysctl  &>/dev/null; then n=$(sysctl -n hw.ncpu         2>/dev/null || true)
+    fi
+    [[ "$n" =~ ^[0-9]+$ ]] || n="${NUMBER_OF_PROCESSORS:-1}"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=1
+    printf '%s' "$n"
+}
+
+if [[ "$COMMAND" == "x" ]]; then
+    _CPUS=$(cpu_count)
+    if [[ $JOBS -le 0 ]]; then
+        # Bare "-j": one worker per core, less one so the machine stays usable.
+        JOBS=$_CPUS
+        if (( JOBS > 1 )); then JOBS=$(( JOBS - 1 )); fi
+    elif (( JOBS > _CPUS )); then
+        log "Note    : -j $JOBS capped at $_CPUS (CPU cores)"
+        JOBS=$_CPUS
+    fi
+    if [[ $JOBS -eq 1 ]]; then
+        verbose "Workers: 1 of $_CPUS core(s) — sequential, pass -j for parallel extraction"
+    else
+        verbose "Workers requested: $JOBS of $_CPUS core(s)"
+    fi
+fi
+
 # ── MD5 helper ─────────────────────────────────────────────────────────────────
 _md5() {
     case "$_md5_tool" in
@@ -219,18 +267,27 @@ write_entry() {
     fi
 }
 
-# Verify every extracted file in one md5 process per xargs batch rather than
-# one (plus an awk) per file.  Order is preserved, so results pair positionally
-# with the expected hashes.
-verify_batch() {
-    local n=${#vf_paths[@]}
+# Verify the extracted files of one plan range in a single md5 process per
+# xargs batch rather than one (plus an awk) per file.  Order is preserved, so
+# results pair positionally with the expected hashes.  The mismatch count is
+# written to a file, which is how a parallel worker reports it back.
+verify_range() {
+    local start="$1" end="$2" tag="$3"
+    local i names=() paths=() hashes=()
+
+    for (( i = start; i < end; i++ )); do
+        [[ -n "${ex_hashes[i]}" ]] || continue
+        names+=("${ex_names[i]}"); paths+=("${ex_paths[i]}"); hashes+=("${ex_hashes[i]}")
+    done
+
+    local n=${#paths[@]}
     [[ $n -eq 0 ]] && return 0
 
-    local actual_file="$_TMP_DIR/actual_hashes"
+    local actual_file="$_TMP_DIR/actual_hashes.$tag"
     case "$_md5_tool" in
-        md5sum) printf '%s\0' "${vf_paths[@]}" | xargs -0 md5sum \
+        md5sum) printf '%s\0' "${paths[@]}" | xargs -0 md5sum \
                     | awk '{ h = $1; sub(/^\\/, "", h); print h }' > "$actual_file" ;;
-        md5)    printf '%s\0' "${vf_paths[@]}" | xargs -0 md5 -q > "$actual_file" ;;
+        md5)    printf '%s\0' "${paths[@]}" | xargs -0 md5 -q > "$actual_file" ;;
     esac
 
     local produced
@@ -240,21 +297,42 @@ verify_batch() {
         return 0
     fi
 
-    local i=0 actual expected mismatches=0
+    local j=0 actual expected mismatches=0
     while IFS= read -r actual; do
-        expected="${vf_hashes[$i]}"
+        expected="${hashes[$j]}"
         if [[ "${actual,,}" != "${expected,,}" ]]; then
-            log "  WARNING hash mismatch for ${vf_names[$i]}"
+            log "  WARNING hash mismatch for ${names[$j]}"
             log "    expected : $expected"
             log "    actual   : $actual"
             (( mismatches++ )) || true
         fi
-        # "|| true": (( i++ )) returns 1 when i is 0, which set -e would treat as failure.
-        (( i++ )) || true
+        # "|| true": (( j++ )) returns 1 when j is 0, which set -e would treat as failure.
+        (( j++ )) || true
     done < "$actual_file"
 
+    printf '%s\n' "$mismatches" > "$_TMP_DIR/mismatches.$tag"
     verbose "  Hashes verified: $n  mismatches: $mismatches"
     return 0
+}
+
+# One contiguous slice of the extraction plan: write every file, then verify
+# the slice.  Runs in the parent for -j 1, in a background subshell otherwise.
+extract_range() {
+    local start="$1" end="$2" tag="$3" i
+
+    for (( i = start; i < end; i++ )); do
+        if [[ $VERBOSE -eq 1 ]]; then
+            log "  Extract: ${ex_names[i]} -> ${ex_paths[i]#$DEST_DIR/}  (dat=${ex_dats[i]##*/}  off=${ex_offsets[i]}  sz=${ex_sizes[i]})"
+        elif [[ "${ex_paths[i]}" != "$DEST_DIR/${ex_names[i]}" ]]; then
+            log "  Extract: ${ex_names[i]} -> ${ex_paths[i]#$DEST_DIR/}"
+        else
+            log "  Extract: ${ex_names[i]}"
+        fi
+
+        write_entry "${ex_dats[i]}" "${ex_paths[i]}" "${ex_offsets[i]}" "${ex_sizes[i]}"
+    done
+
+    verify_range "$start" "$end" "$tag"
 }
 
 # ── create (pack) ──────────────────────────────────────────────────────────────
@@ -601,13 +679,14 @@ fi
 #   1. plan   — a fork-free scan that resolves output paths and collects the
 #               directory set (path handling is bash builtins, not dirname)
 #   2. mkdir  — every directory created in one batched call
-#   3. write  — one dd per file, then hashes verified in batches
+#   3. write  — one dd per file, then hashes verified in batches;
+#               split across $JOBS workers when -j asks for more than one
 extracted=0
 deleted=0
 skipped=0
+mismatches=0
 
-ex_names=(); ex_dats=(); ex_paths=(); ex_offsets=(); ex_sizes=()
-vf_names=(); vf_paths=(); vf_hashes=()
+ex_names=(); ex_dats=(); ex_paths=(); ex_offsets=(); ex_sizes=(); ex_hashes=()
 declare -A ex_dirs=()
 
 while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
@@ -640,10 +719,10 @@ while IFS=$'\t' read -r filepath dat_file offset size hash ts; do
     ex_sizes+=("$size")
     ex_dirs["${out_path%/*}"]=1
 
-    if [[ $SKIP_HASH -eq 0 && -n "$hash" ]]; then
-        vf_names+=("$filepath")
-        vf_paths+=("$out_path")
-        vf_hashes+=("$hash")
+    if [[ $SKIP_HASH -eq 0 ]]; then
+        ex_hashes+=("$hash")
+    else
+        ex_hashes+=("")
     fi
 done <<< "$matched_entries"
 
@@ -655,22 +734,59 @@ if [[ $extracted -gt 0 ]]; then
 
     printf '%s\0' "${!ex_dirs[@]}" | xargs -0 mkdir -p
 
-    for (( i = 0; i < extracted; i++ )); do
-        if [[ $VERBOSE -eq 1 ]]; then
-            log "  Extract: ${ex_names[i]} -> ${ex_paths[i]#$DEST_DIR/}  (dat=${ex_dats[i]##*/}  off=${ex_offsets[i]}  sz=${ex_sizes[i]})"
-        elif [[ "${ex_paths[i]}" != "$DEST_DIR/${ex_names[i]}" ]]; then
-            log "  Extract: ${ex_names[i]} -> ${ex_paths[i]#$DEST_DIR/}"
-        else
-            log "  Extract: ${ex_names[i]}"
-        fi
+    if [[ $JOBS -gt 1 && $extracted -gt 1 ]]; then
+        [[ $JOBS -gt $extracted ]] && JOBS=$extracted
 
-        write_entry "${ex_dats[i]}" "${ex_paths[i]}" "${ex_offsets[i]}" "${ex_sizes[i]}"
+        # Contiguous ranges of roughly equal cost.  A file is charged its bytes
+        # plus a flat per-file overhead: extraction is process-bound, so a run
+        # of tiny files is real work that a split on bytes alone would hand to
+        # a single worker.
+        _FILE_COST=65536
+        range_starts=(); range_ends=()
+        total=0
+        for (( i = 0; i < extracted; i++ )); do total=$(( total + ex_sizes[i] + _FILE_COST )); done
+        target=$(( (total + JOBS - 1) / JOBS ))
+
+        # The second cut condition keeps every worker fed: once only as many
+        # files remain as there are workers left, each takes one.
+        acc=0; start=0; w=1
+        for (( i = 0; i < extracted; i++ )); do
+            acc=$(( acc + ex_sizes[i] + _FILE_COST ))
+            if (( w < JOBS && i + 1 < extracted )) &&
+               (( acc >= target || extracted - i - 1 <= JOBS - w )); then
+                range_starts+=("$start"); range_ends+=("$(( i + 1 ))")
+                start=$(( i + 1 )); acc=0; w=$(( w + 1 ))
+            fi
+        done
+        range_starts+=("$start"); range_ends+=("$extracted")
+
+        log "Workers : ${#range_starts[@]}"
+
+        # "trap - EXIT": a worker must not run the parent's cleanup and delete
+        # the temp dir its siblings are still reporting into.
+        pids=(); failed=0
+        for (( w = 0; w < ${#range_starts[@]}; w++ )); do
+            ( trap - EXIT; extract_range "${range_starts[w]}" "${range_ends[w]}" "$w" ) &
+            pids+=("$!")
+        done
+        for pid in "${pids[@]}"; do
+            wait "$pid" || failed=$(( failed + 1 ))
+        done
+        [[ $failed -gt 0 ]] && die "$failed of ${#pids[@]} extraction worker(s) failed."
+    else
+        extract_range 0 "$extracted" 0
+    fi
+
+    for f in "$_TMP_DIR"/mismatches.*; do
+        [[ -f "$f" ]] || continue
+        mismatches=$(( mismatches + $(cat "$f") ))
     done
-
-    verify_batch
 fi
 
 log "────────────────────────────────────────"
 log "Extracted            : $extracted"
 log "Deleted/empty (sz=0) : $deleted"
 log "Skipped (exists)     : $skipped"
+if [[ $SKIP_HASH -eq 0 && $extracted -gt 0 ]]; then
+    log "Hash mismatches      : $mismatches"
+fi
